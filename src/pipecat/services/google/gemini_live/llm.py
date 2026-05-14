@@ -1466,80 +1466,83 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_msg_model_turn(self, msg: LiveServerMessage):
         """Handle the model turn message."""
-        part = msg.server_content.model_turn.parts[0]
-        if not part:
+        parts = msg.server_content.model_turn.parts
+        if not parts:
             return
 
         await self.stop_ttfb_metrics()
-
-        # part.text is added when `modalities` is set to TEXT; otherwise, it's None
-        text = part.text
-        if text:
-            if not self._bot_is_responding:
-                # Update bot responding state and send service start frame
-                # (AUDIO modality case)
-                await self._set_bot_is_responding(True)
-                await self.push_frame(LLMFullResponseStartFrame())
-
-            # Check if this is a thought
-            if part.thought:
-                # Gemini Live emits fully-formed thoughts rather than chunks,
-                # so bracket each thought in start/end frames
-                await self.push_frame(LLMThoughtStartFrame())
-                await self.push_frame(LLMThoughtTextFrame(text))
-                await self.push_frame(LLMThoughtEndFrame())
-            else:
-                # Regular text response
-                self._bot_text_buffer += text
-                self._search_result_buffer += text  # Also accumulate for grounding
-                frame = LLMTextFrame(text=text)
-                await self.push_frame(frame)
 
         # Check for grounding metadata in server content
         if msg.server_content and msg.server_content.grounding_metadata:
             self._accumulated_grounding_metadata = msg.server_content.grounding_metadata
 
-        # If we have no audio, stop here.
-        # All logic below this point pertains to the AUDIO modality.
-        inline_data = part.inline_data
-        if not inline_data:
-            return
+        for part in parts:
+            if not part:
+                continue
 
-        # Check if mime type matches expected format
-        expected_mime_type = f"audio/pcm;rate={self._sample_rate}"
-        if inline_data.mime_type == expected_mime_type:
-            # Perfect match, continue processing
-            pass
-        elif inline_data.mime_type == "audio/pcm":
-            # Sample rate not provided in mime type, assume default
-            if not hasattr(self, "_sample_rate_warning_logged"):
-                logger.warning(
-                    f"Sample rate not provided in mime type '{inline_data.mime_type}', assuming rate of {self._sample_rate}"
-                )
-                self._sample_rate_warning_logged = True
-        else:
-            # Unrecognized format
-            logger.warning(f"Unrecognized server_content format {inline_data.mime_type}")
-            return
+            # part.text is added when `modalities` is set to TEXT; otherwise, it's None
+            text = part.text
+            if text:
+                if not self._bot_is_responding:
+                    # Update bot responding state and send service start frame
+                    # (AUDIO modality case)
+                    await self._set_bot_is_responding(True)
+                    await self.push_frame(LLMFullResponseStartFrame())
 
-        audio = inline_data.data
-        if not audio:
-            return
+                # Check if this is a thought
+                if part.thought:
+                    # Gemini Live emits fully-formed thoughts rather than chunks,
+                    # so bracket each thought in start/end frames
+                    await self.push_frame(LLMThoughtStartFrame())
+                    await self.push_frame(LLMThoughtTextFrame(text))
+                    await self.push_frame(LLMThoughtEndFrame())
+                else:
+                    # Regular text response
+                    self._bot_text_buffer += text
+                    self._search_result_buffer += text  # Also accumulate for grounding
+                    frame = LLMTextFrame(text=text)
+                    await self.push_frame(frame)
 
-        # Update bot responding state and send service start frames
-        # (AUDIO modality case)
-        if not self._bot_is_responding:
-            await self._set_bot_is_responding(True)
-            await self.push_frame(TTSStartedFrame())
-            await self.push_frame(LLMFullResponseStartFrame())
+            # If we have no audio for this part, continue checking remaining parts.
+            inline_data = part.inline_data
+            if not inline_data:
+                continue
 
-        self._bot_audio_buffer.extend(audio)
-        frame = TTSAudioRawFrame(
-            audio=audio,
-            sample_rate=self._sample_rate,
-            num_channels=1,
-        )
-        await self.push_frame(frame)
+            # Check if mime type matches expected format
+            expected_mime_type = f"audio/pcm;rate={self._sample_rate}"
+            if inline_data.mime_type == expected_mime_type:
+                # Perfect match, continue processing
+                pass
+            elif inline_data.mime_type == "audio/pcm":
+                # Sample rate not provided in mime type, assume default
+                if not hasattr(self, "_sample_rate_warning_logged"):
+                    logger.warning(
+                        f"Sample rate not provided in mime type '{inline_data.mime_type}', assuming rate of {self._sample_rate}"
+                    )
+                    self._sample_rate_warning_logged = True
+            else:
+                # Unrecognized format
+                logger.warning(f"Unrecognized server_content format {inline_data.mime_type}")
+                continue
+
+            audio = inline_data.data
+            if not audio:
+                continue
+
+            # Update bot responding state and send service start frames
+            # (AUDIO modality case)
+            if not self._bot_is_responding:
+                await self._set_bot_is_responding(True)
+                await self.push_frame(TTSStartedFrame())
+                await self.push_frame(LLMFullResponseStartFrame())
+
+            self._bot_audio_buffer.extend(audio)
+            frame = TTSAudioRawFrame(
+                audio=audio,
+                sample_rate=self._sample_rate,
+                num_channels=1,
+            )
+            await self.push_frame(frame)
 
     @traced_gemini_live(operation="llm_tool_call")
     async def _handle_msg_tool_call(self, message: LiveServerMessage):
