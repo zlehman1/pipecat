@@ -4,18 +4,30 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from pipecat.frames.frames import (
+    Frame,
+    FunctionCallCancelFrame,
     FunctionCallFromLLM,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
+    InterruptionFrame,
+    StartFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMUserAggregator,
+    LLMUserAggregatorParams,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings
+from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.turns.user_mute.function_call_user_mute_strategy import FunctionCallUserMuteStrategy
 
 
@@ -37,6 +49,45 @@ class MockLLMService(LLMService):
             user_turn_completion_config=None,
         )
         super().__init__(settings=settings, **kwargs)
+
+
+class PipelineTestLLMService(MockLLMService):
+    """Mock LLM service that lets pipeline frames reach the test sink."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
+
+class FunctionCallTriggerAndRecordingProcessor(FrameProcessor):
+    """Starts a test function call and captures downstream frames."""
+
+    def __init__(self, service: MockLLMService):
+        super().__init__(enable_direct_mode=True)
+        self._service = service
+        self.downstream_frames: list[Frame] = []
+        self.function_call_cancelled = asyncio.Event()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM:
+            self.downstream_frames.append(frame)
+            if isinstance(frame, FunctionCallCancelFrame):
+                self.function_call_cancelled.set()
+        await self.push_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            self.create_task(
+                self._service.run_function_calls(
+                    [
+                        FunctionCallFromLLM(
+                            function_name="slow_tool",
+                            tool_call_id="call_1",
+                            arguments={},
+                            context=LLMContext(),
+                        )
+                    ]
+                )
+            )
 
 
 class TestLLMService(unittest.IsolatedAsyncioTestCase):
@@ -171,3 +222,51 @@ class TestLLMService(unittest.IsolatedAsyncioTestCase):
             muted = await strategy.process_frame(frame)
 
         self.assertFalse(muted)
+
+    async def test_muted_function_call_interruption_cancels_running_tool(self):
+        service = PipelineTestLLMService()
+        service._call_event_handler = AsyncMock()
+        user_aggregator = LLMUserAggregator(
+            LLMContext(),
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[FunctionCallUserMuteStrategy()]
+            ),
+        )
+        recorder = FunctionCallTriggerAndRecordingProcessor(service)
+        pipeline = Pipeline([user_aggregator, service, recorder])
+
+        tool_started = asyncio.Event()
+        tool_cancelled = asyncio.Event()
+        tool_timed_out = asyncio.Event()
+
+        async def slow_tool(params):
+            tool_started.set()
+            try:
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=0.5)
+                await params.result_callback("unexpected result")
+            except asyncio.TimeoutError:
+                tool_timed_out.set()
+                await params.result_callback("not cancelled")
+            except asyncio.CancelledError:
+                tool_cancelled.set()
+                raise
+
+        service.register_function("slow_tool", slow_tool, cancel_on_interruption=True)
+
+        await run_test(
+            pipeline,
+            frames_to_send=[
+                SleepFrame(sleep=0.05),
+                InterruptionFrame(),
+                SleepFrame(sleep=0.05),
+            ],
+        )
+
+        self.assertTrue(tool_started.is_set())
+        self.assertTrue(tool_cancelled.is_set())
+        self.assertTrue(recorder.function_call_cancelled.is_set())
+        self.assertFalse(tool_timed_out.is_set())
+        self.assertFalse(user_aggregator._user_is_muted)
+        self.assertTrue(
+            any(isinstance(frame, FunctionCallCancelFrame) for frame in recorder.downstream_frames)
+        )
