@@ -46,7 +46,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, is_given as is_context_given
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import (
@@ -501,7 +501,7 @@ class GrokRealtimeLLMService(LLMService):
         elif isinstance(frame, LLMMessagesAppendFrame):
             await self._handle_messages_append(frame)
         elif isinstance(frame, LLMSetToolsFrame):
-            await self._send_session_update()
+            await self._send_session_update(force_context_tools=True)
 
         await self.push_frame(frame, direction)
 
@@ -609,7 +609,7 @@ class GrokRealtimeLLMService(LLMService):
         self._warn_unhandled_updated_settings(changed.keys() - handled)
         return changed
 
-    async def _send_session_update(self):
+    async def _send_session_update(self, *, force_context_tools: bool = False):
         """Update session settings on the server."""
         settings = assert_given(self._settings.session_properties)
         adapter: GrokRealtimeLLMAdapter = self.get_llm_adapter()
@@ -620,7 +620,7 @@ class GrokRealtimeLLMService(LLMService):
                 system_instruction=assert_given(self._settings.system_instruction),
             )
 
-            if llm_invocation_params["tools"]:
+            if force_context_tools or is_context_given(self._context.tools):
                 settings.tools = llm_invocation_params["tools"]
 
             # The adapter resolves conflicts between init-provided and
@@ -797,18 +797,33 @@ class GrokRealtimeLLMService(LLMService):
         await self.push_frame(LLMFullResponseEndFrame())
         self._current_assistant_response = None
 
-        # Error handling
-        if evt.response.status == "failed":
-            error_msg = "Response failed"
-            if evt.response.status_details:
-                error_msg = str(evt.response.status_details)
-            await self.push_error(error_msg=error_msg)
+        response_status = getattr(evt.response, "status", None)
+        if response_status != "completed":
+            self._discard_pending_function_call_batch(evt.response)
+            if response_status == "failed":
+                error_msg = "Response failed"
+                if evt.response.status_details:
+                    error_msg = str(evt.response.status_details)
+                await self.push_error(error_msg=error_msg)
+            else:
+                logger.debug(
+                    f"{self}: skipping Grok function-call batch for "
+                    f"response status={response_status}"
+                )
             return
 
         # Update conversation items
         for item in evt.response.output:
             await self._call_event_handler("on_conversation_item_updated", item.id, item)
             if item.type == "function_call" and item.call_id and item.arguments is not None:
+                item_status = getattr(item, "status", None)
+                if item_status is not None and item_status != "completed":
+                    self._discard_pending_function_call(item.call_id)
+                    logger.debug(
+                        f"{self}: skipping Grok function call {item.call_id} "
+                        f"for item status={item_status}"
+                    )
+                    continue
                 await self._queue_function_call(
                     tool_call_id=item.call_id,
                     function_name=item.name,
@@ -909,6 +924,28 @@ class GrokRealtimeLLMService(LLMService):
         self._queued_function_call_ids = set()
         await self.run_function_calls(function_calls)
         logger.debug(f"Processed {len(function_calls)} Grok function call(s)")
+
+    def _discard_pending_function_call_batch(self, response=None):
+        """Clear queued Grok tool calls that belong to an unsafe response."""
+        response_call_ids = {
+            item.call_id
+            for item in getattr(response, "output", []) or []
+            if getattr(item, "type", None) == "function_call" and getattr(item, "call_id", None)
+        }
+        for tool_call_id in self._queued_function_call_ids_set() | response_call_ids:
+            self._pending_function_calls.pop(tool_call_id, None)
+        self._pending_function_call_batch = []
+        self._queued_function_call_ids = set()
+
+    def _discard_pending_function_call(self, tool_call_id: str):
+        """Clear one queued Grok tool call without touching the rest of the batch."""
+        self._pending_function_calls.pop(tool_call_id, None)
+        self._pending_function_call_batch = [
+            function_call
+            for function_call in self._pending_function_call_batch_queue()
+            if function_call.tool_call_id != tool_call_id
+        ]
+        self._queued_function_call_ids_set().discard(tool_call_id)
 
     def _pending_function_call_batch_queue(self) -> list[FunctionCallFromLLM]:
         if not hasattr(self, "_pending_function_call_batch"):

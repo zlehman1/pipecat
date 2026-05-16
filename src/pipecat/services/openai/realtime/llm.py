@@ -48,7 +48,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, is_given as is_context_given
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import (
@@ -561,7 +561,7 @@ class OpenAIRealtimeLLMService(LLMService):
         elif isinstance(frame, LLMMessagesAppendFrame):
             await self._handle_messages_append(frame)
         elif isinstance(frame, LLMSetToolsFrame):
-            await self._send_session_update()
+            await self._send_session_update(force_context_tools=True)
 
         await self.push_frame(frame, direction)
 
@@ -655,7 +655,7 @@ class OpenAIRealtimeLLMService(LLMService):
         self._warn_unhandled_updated_settings(changed.keys() - handled)
         return changed
 
-    async def _send_session_update(self):
+    async def _send_session_update(self, *, force_context_tools: bool = False):
         settings = assert_given(self._settings.session_properties)
         adapter: OpenAIRealtimeLLMAdapter = self.get_llm_adapter()
 
@@ -665,8 +665,10 @@ class OpenAIRealtimeLLMService(LLMService):
                 system_instruction=assert_given(self._settings.system_instruction),
             )
 
-            # tools given in the context override the tools in the session properties
-            if llm_invocation_params["tools"]:
+            # Tools given in the context override the tools in the session
+            # properties. A runtime LLMSetToolsFrame can also intentionally
+            # clear provider tools; OpenAI documents this as tools=[].
+            if force_context_tools or is_context_given(self._context.tools):
                 settings.tools = llm_invocation_params["tools"]
 
             # The adapter resolves conflicts between init-provided and
