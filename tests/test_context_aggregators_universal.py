@@ -450,6 +450,84 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         # The user mute strategies should have muted the user.
         self.assertFalse(user_turn)
 
+    async def test_interruption_not_suppressed_while_user_muted(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[
+                    FunctionCallUserMuteStrategy(),
+                ]
+            ),
+        )
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            InterruptionFrame(),
+            VADUserStartedSpeakingFrame(),
+            VADUserStoppedSpeakingFrame(),
+            TranscriptionFrame(text="Actually never mind", user_id="", timestamp="now"),
+            FunctionCallResultFrame(
+                function_name="fn_1", tool_call_id="1", arguments={}, result={}
+            ),
+        ]
+
+        down_frames, _ = await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+        )
+
+        self.assertTrue(any(isinstance(frame, InterruptionFrame) for frame in down_frames))
+        self.assertFalse(
+            any(
+                isinstance(
+                    frame,
+                    (
+                        VADUserStartedSpeakingFrame,
+                        VADUserStoppedSpeakingFrame,
+                        TranscriptionFrame,
+                    ),
+                )
+                for frame in down_frames
+            )
+        )
+
+    async def test_interruption_suppressed_while_user_muted_by_bot_speech(self):
+        context = LLMContext()
+
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_mute_strategies=[
+                    FirstSpeechUserMuteStrategy(),
+                ]
+            ),
+        )
+        pipeline = Pipeline([user_aggregator])
+
+        frames_to_send = [
+            BotStartedSpeakingFrame(),
+            SleepFrame(),
+            InterruptionFrame(),
+            BotStoppedSpeakingFrame(),
+        ]
+
+        down_frames, _ = await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+        )
+
+        self.assertFalse(any(isinstance(frame, InterruptionFrame) for frame in down_frames))
+
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""
         context = LLMContext()

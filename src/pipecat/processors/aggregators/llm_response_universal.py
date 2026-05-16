@@ -79,7 +79,7 @@ from pipecat.processors.aggregators.llm_context_summarizer import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_idle_controller import UserIdleController
-from pipecat.turns.user_mute import BaseUserMuteStrategy
+from pipecat.turns.user_mute import BaseUserMuteStrategy, FunctionCallUserMuteStrategy
 from pipecat.turns.user_start import BaseUserTurnStartStrategy, UserTurnStartedParams
 from pipecat.turns.user_stop import BaseUserTurnStopStrategy, UserTurnStoppedParams
 from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
@@ -449,6 +449,7 @@ class LLMUserAggregator(LLMContextAggregator):
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
         self._user_is_muted = False
+        self._active_user_mute_strategies: set[int] = set()
         self._user_turn_start_timestamp = ""
 
         self._user_turn_controller = UserTurnController(
@@ -617,25 +618,17 @@ class LLMUserAggregator(LLMContextAggregator):
         if isinstance(frame, (StartFrame, EndFrame, CancelFrame)):
             return False
 
-        should_mute_frame = self._user_is_muted and isinstance(
-            frame,
-            (
-                InterruptionFrame,
-                VADUserStartedSpeakingFrame,
-                VADUserStoppedSpeakingFrame,
-                UserStartedSpeakingFrame,
-                UserStoppedSpeakingFrame,
-                InterimTranscriptionFrame,
-                TranscriptionFrame,
-            ),
-        )
+        should_mute_frame = self._user_is_muted and self._should_mute_frame(frame)
 
         if should_mute_frame:
             logger.trace(f"{frame.name} suppressed - user currently muted")
 
-        should_mute_next_time = False
-        for s in self._params.user_mute_strategies:
-            should_mute_next_time |= await s.process_frame(frame)
+        active_user_mute_strategies = set()
+        for index, strategy in enumerate(self._params.user_mute_strategies):
+            if await strategy.process_frame(frame):
+                active_user_mute_strategies.add(index)
+
+        should_mute_next_time = bool(active_user_mute_strategies)
 
         if should_mute_next_time != self._user_is_muted:
             logger.debug(f"{self}: user is now {'muted' if should_mute_next_time else 'unmuted'}")
@@ -649,7 +642,36 @@ class LLMUserAggregator(LLMContextAggregator):
                 await self._call_event_handler("on_user_mute_stopped")
                 await self.broadcast_frame(UserMuteStoppedFrame)
 
+        self._active_user_mute_strategies = active_user_mute_strategies
+
         return should_mute_frame
+
+    def _should_mute_frame(self, frame: Frame) -> bool:
+        if isinstance(frame, InterruptionFrame):
+            # Function-call mutes should still let cancellation control flow reach
+            # the LLM service; speech/greeting mutes remain non-interruptible.
+            return not self._only_function_call_mute_active()
+
+        return isinstance(
+            frame,
+            (
+                VADUserStartedSpeakingFrame,
+                VADUserStoppedSpeakingFrame,
+                UserStartedSpeakingFrame,
+                UserStoppedSpeakingFrame,
+                InterimTranscriptionFrame,
+                TranscriptionFrame,
+            ),
+        )
+
+    def _only_function_call_mute_active(self) -> bool:
+        if not self._active_user_mute_strategies:
+            return False
+
+        return all(
+            isinstance(self._params.user_mute_strategies[index], FunctionCallUserMuteStrategy)
+            for index in self._active_user_mute_strategies
+        )
 
     async def _handle_llm_run(self, frame: LLMRunFrame):
         await self.push_context_frame()
