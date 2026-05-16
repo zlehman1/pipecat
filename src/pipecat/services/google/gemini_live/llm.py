@@ -537,6 +537,7 @@ class GeminiLiveLLMService(LLMService):
         self._bot_audio_buffer = bytearray()
         self._bot_text_buffer = ""
         self._llm_output_buffer = ""
+        self._pending_output_transcription_buffer = ""
         self._transcription_timeout_task = None
 
         self._sample_rate = 24000
@@ -701,6 +702,7 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_interruption(self):
         await self._discard_deferred_function_calls_for_interruption()
+        self._discard_pending_output_transcription()
         if self._awaiting_post_tool_response_turn:
             self._awaiting_post_tool_response_turn = False
         if self._bot_is_responding:
@@ -1231,7 +1233,8 @@ class GeminiLiveLLMService(LLMService):
                             # turn_complete on the same message, so process the
                             # content-bearing fields before closing the turn.
                             sc = message.server_content
-                            if sc and sc.interrupted:
+                            interrupted = bool(sc and sc.interrupted)
+                            if interrupted:
                                 # NOTE: while the service triggers interruptions in
                                 # the specific case of barge-ins, it does *not*
                                 # emit UserStarted/StoppedSpeakingFrames, as the
@@ -1244,29 +1247,32 @@ class GeminiLiveLLMService(LLMService):
                                 # turn strategies.
                                 logger.debug("Gemini VAD: interrupted signal received")
                                 await self._handle_msg_interrupted()
-                            if sc and sc.model_turn:
-                                await self._handle_msg_model_turn(message)
-                            if sc and sc.input_transcription:
-                                await self._handle_msg_input_transcription(message)
-                            if sc and sc.output_transcription:
-                                await self._handle_msg_output_transcription(message)
-                            if (
-                                sc
-                                and sc.grounding_metadata
-                                and not sc.model_turn
-                                and not sc.output_transcription
-                            ):
-                                # model_turn/output_transcription already defer
-                                # bundled grounding metadata to turn_complete.
-                                await self._handle_msg_grounding_metadata(message)
-                            if sc and sc.turn_complete:
-                                if not message.usage_metadata:
-                                    logger.warning("Received turn_complete without usage_metadata")
-                                await self._handle_msg_turn_complete(message)
-                                if message.usage_metadata:
-                                    await self._handle_msg_usage_metadata(message)
-                            if message.tool_call:
-                                await self._handle_msg_tool_call(message)
+                            if not interrupted:
+                                if sc and sc.model_turn:
+                                    await self._handle_msg_model_turn(message)
+                                if sc and sc.input_transcription:
+                                    await self._handle_msg_input_transcription(message)
+                                if sc and sc.output_transcription:
+                                    await self._handle_msg_output_transcription(message)
+                                if (
+                                    sc
+                                    and sc.grounding_metadata
+                                    and not sc.model_turn
+                                    and not sc.output_transcription
+                                ):
+                                    # model_turn/output_transcription already defer
+                                    # bundled grounding metadata to turn_complete.
+                                    await self._handle_msg_grounding_metadata(message)
+                                if sc and sc.turn_complete:
+                                    if not message.usage_metadata:
+                                        logger.warning(
+                                            "Received turn_complete without usage_metadata"
+                                        )
+                                    await self._handle_msg_turn_complete(message)
+                                    if message.usage_metadata:
+                                        await self._handle_msg_usage_metadata(message)
+                                if message.tool_call:
+                                    await self._handle_msg_tool_call(message)
                             if message.tool_call_cancellation:
                                 await self._handle_msg_tool_call_cancellation(message)
                             if message.session_resumption_update:
@@ -1802,6 +1808,7 @@ class GeminiLiveLLMService(LLMService):
 
         # Trace the complete LLM response (this will be handled by the decorator)
         # The decorator will extract the output text and usage metadata from the message
+        await self._flush_pending_output_transcription()
 
         self._bot_text_buffer = ""
         self._llm_output_buffer = ""
@@ -1985,10 +1992,25 @@ class GeminiLiveLLMService(LLMService):
         llm_text_frame.append_to_context = False
         await self.push_frame(llm_text_frame)
 
-        # Push TTSTextFrame
+        # Buffer TTSTextFrame context until turn_complete. Gemini output
+        # transcription can run ahead of audio; committing it immediately can
+        # leave context with assistant text the caller never heard after barge-in.
+        self._pending_output_transcription_buffer += text
+
+    async def _flush_pending_output_transcription(self):
+        text = getattr(self, "_pending_output_transcription_buffer", "")
+        if not text:
+            return
+        self._pending_output_transcription_buffer = ""
         tts_text_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
         tts_text_frame.includes_inter_frame_spaces = True
         await self.push_frame(tts_text_frame)
+
+    def _discard_pending_output_transcription(self):
+        self._pending_output_transcription_buffer = ""
+        self._llm_output_buffer = ""
+        self._search_result_buffer = ""
+        self._accumulated_grounding_metadata = None
 
     async def _handle_msg_grounding_metadata(self, message: LiveServerMessage):
         """Handle dedicated grounding metadata messages."""
