@@ -731,6 +731,10 @@ class GeminiLiveLLMService(LLMService):
         if self._vad_disabled and self._session and self._ready_for_realtime_input:
             try:
                 await self._session.send_realtime_input(activity_start=ActivityStart())
+                await self._emit_realtime_input_event(
+                    "activity_start",
+                    source="vad_activity_start",
+                )
             except Exception as e:
                 await self._handle_send_error(e)
 
@@ -742,6 +746,10 @@ class GeminiLiveLLMService(LLMService):
         if self._vad_disabled and self._session and self._ready_for_realtime_input:
             try:
                 await self._session.send_realtime_input(activity_end=ActivityEnd())
+                await self._emit_realtime_input_event(
+                    "activity_end",
+                    source="vad_activity_end",
+                )
             except Exception as e:
                 await self._handle_send_error(e)
         if self._needs_initial_turn_complete_message:
@@ -1403,6 +1411,14 @@ class GeminiLiveLLMService(LLMService):
             await self._session.send_realtime_input(
                 audio=Blob(data=frame.audio, mime_type=f"audio/pcm;rate={frame.sample_rate}")
             )
+            await self._emit_realtime_input_event(
+                "audio",
+                source="user_audio",
+                audio_byte_count=len(frame.audio),
+                audio_sample_rate=frame.sample_rate,
+                audio_num_channels=frame.num_channels,
+                audio_mime_type=f"audio/pcm;rate={frame.sample_rate}",
+            )
         except Exception as e:
             await self._handle_send_error(e)
 
@@ -1435,6 +1451,12 @@ class GeminiLiveLLMService(LLMService):
 
         try:
             await self._session.send_realtime_input(text=text)
+            await self._emit_realtime_input_event(
+                "text",
+                source="user_text",
+                text_present=bool(text),
+                blank_text=not bool(text.strip()),
+            )
         except Exception as e:
             await self._handle_send_error(e)
 
@@ -1461,6 +1483,11 @@ class GeminiLiveLLMService(LLMService):
 
         try:
             await self._session.send_realtime_input(video=Blob(data=data, mime_type="image/jpeg"))
+            await self._emit_realtime_input_event(
+                "video",
+                source="user_video",
+                video_mime_type="image/jpeg",
+            )
         except Exception as e:
             await self._handle_send_error(e)
 
@@ -1569,6 +1596,12 @@ class GeminiLiveLLMService(LLMService):
             # Gemini 3.x wants turn_complete=True, but also won't run inference without a realtime input
             if self._is_gemini_3 and trigger_inference:
                 await self._session.send_realtime_input(text=" ")
+                await self._emit_realtime_input_event(
+                    "nudge",
+                    source="initial_response_nudge",
+                    text_present=True,
+                    blank_text=True,
+                )
         except Exception as e:
             await self._handle_send_error(e)
 
@@ -1608,6 +1641,12 @@ class GeminiLiveLLMService(LLMService):
             # Gemini 3.x wants turn_complete=True, but also won't run inference without a realtime input
             if self._is_gemini_3:
                 await self._session.send_realtime_input(text=" ")
+                await self._emit_realtime_input_event(
+                    "nudge",
+                    source="single_response_nudge",
+                    text_present=True,
+                    blank_text=True,
+                )
         except Exception as e:
             await self._handle_send_error(e)
 
@@ -1660,6 +1699,12 @@ class GeminiLiveLLMService(LLMService):
             )
             if self._is_gemini_3:
                 await self._session.send_realtime_input(text=" ")
+                await self._emit_realtime_input_event(
+                    "nudge",
+                    source="post_tool_nudge",
+                    text_present=True,
+                    blank_text=True,
+                )
             self._awaiting_post_tool_response_turn = True
             return True
         except Exception as e:
@@ -1694,6 +1739,24 @@ class GeminiLiveLLMService(LLMService):
             )
         except Exception as exc:
             logger.debug(f"{self}: failed to emit Gemini provider event: {exc}")
+
+    async def _emit_realtime_input_event(
+        self,
+        modality: str,
+        **metadata: Any,
+    ) -> None:
+        event_type = (
+            "client.realtime_input_nudge.sent"
+            if modality == "nudge"
+            else f"client.realtime_input.{modality}.sent"
+        )
+        await self._emit_provider_event(
+            {
+                "type": event_type,
+                "modality": modality,
+                **metadata,
+            }
+        )
 
     def _post_tool_response_turn_pending(self) -> bool:
         return bool(getattr(self, "_awaiting_post_tool_response_turn", False))
