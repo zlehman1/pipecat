@@ -14,6 +14,7 @@ voice transcription, streaming responses, and tool usage.
 import asyncio
 import base64
 import io
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -527,6 +528,8 @@ class GeminiLiveLLMService(LLMService):
         self._pending_tool_response_ids: set[str] = set()
         self._tool_response_session_by_id: dict[str, Any] = {}
         self._awaiting_post_tool_response_turn = False
+        self._active_tool_surface_signature: str | None = None
+        self._tool_surface_override: Any | None = None
         self._user_audio_buffer = bytearray()
         self._user_transcription_buffer = ""
         self._last_transcription_sent = ""
@@ -811,10 +814,35 @@ class GeminiLiveLLMService(LLMService):
                     "Gemini Live manages its own audio generation — ignoring frame."
                 )
         elif isinstance(frame, LLMSetToolsFrame):
-            # TODO: implement runtime tool updates for Gemini Live.
-            pass
+            await self._handle_set_tools(frame)
         else:
             await self.push_frame(frame, direction)
+
+    async def _handle_set_tools(self, frame: LLMSetToolsFrame):
+        self._tool_surface_override = None
+        if self._context:
+            try:
+                self._context.set_tools(frame.tools)
+            except TypeError:
+                # LLMSetToolsFrame also allows provider-native lists. Those cannot
+                # be stored on LLMContext, but Gemini can still use them directly
+                # on the next LiveConnectConfig.
+                self._tool_surface_override = frame.tools
+        else:
+            self._tool_surface_override = frame.tools
+
+        tool_signature = self._current_tool_surface_signature()
+        if tool_signature == self._active_tool_surface_signature:
+            return
+
+        if not self._session:
+            return
+
+        if self._should_defer_reconnect_for_tool_call():
+            logger.debug(f"{self}: deferring Gemini Live tool-surface reconnect")
+            self._reconnect_pending = True
+        else:
+            await self._reconnect()
 
     async def _handle_context(self, context: LLMContext):
         if not self._handled_initial_context:
@@ -900,6 +928,33 @@ class GeminiLiveLLMService(LLMService):
             return
         self._reconnect_pending = False
         await self._reconnect()
+
+    def _current_tool_surface_signature(self) -> str:
+        if self._tool_surface_override is not None:
+            return self._tool_surface_signature(self._tool_surface_override)
+        if not self._context:
+            return self._tool_surface_signature(None)
+        adapter: GeminiLLMAdapter = self.get_llm_adapter()
+        tools = adapter.get_llm_invocation_params(
+            self._context, system_instruction=self._settings.system_instruction
+        ).get("tools")
+        return self._tool_surface_signature(tools)
+
+    def _tool_surface_signature(self, tools: Any) -> str:
+        return json.dumps(
+            tools,
+            default=self._tool_surface_json_default,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _tool_surface_json_default(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if hasattr(value, "to_default_dict"):
+            return value.to_default_dict()
+        return repr(value)
 
     async def _run_pending_function_calls(self):
         """Run any function calls that were deferred while the bot was responding."""
@@ -1075,8 +1130,12 @@ class GeminiLiveLLMService(LLMService):
                 )
                 system_instruction = params["system_instruction"]
                 tools = params["tools"]
+                if self._tool_surface_override is not None:
+                    tools = self._tool_surface_override
             else:
                 system_instruction = self._settings.system_instruction
+                if self._tool_surface_override is not None:
+                    tools = self._tool_surface_override
             if system_instruction:
                 if len(system_instruction) > 400:
                     trimmed = f"{system_instruction[:200]}...{system_instruction[-200:]}"
@@ -1087,6 +1146,7 @@ class GeminiLiveLLMService(LLMService):
             if tools:
                 logger.debug(f"Setting tools: {tools}")
                 config.tools = tools
+            self._active_tool_surface_signature = self._tool_surface_signature(tools)
 
             # Start the connection
             self._connection_task = self.create_task(self._connection_task_handler(config=config))
