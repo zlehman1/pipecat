@@ -749,6 +749,16 @@ class GeminiLiveLLMService(LLMService):
             # NOTE: without this, the model ignores the context it's been
             # seeded with before the user started speaking
             await self._session.send_client_content(turn_complete=True)
+            await self._emit_provider_event(
+                {
+                    "type": "client.content.sent",
+                    "turn_count": 0,
+                    "turn_complete": True,
+                    "trigger_inference": True,
+                    "initial_seed": False,
+                    "reason": "gemini_2_initial_turn_complete_workaround",
+                }
+            )
 
     #
     # frame processing
@@ -1545,6 +1555,16 @@ class GeminiLiveLLMService(LLMService):
                 await self._session.send_client_content(
                     turns=seed_messages, turn_complete=trigger_inference
                 )
+                await self._emit_provider_event(
+                    self._client_content_sent_event(
+                        seed_messages=seed_messages,
+                        source_messages=messages,
+                        turn_complete=trigger_inference,
+                        trigger_inference=trigger_inference,
+                        initial_seed=True,
+                        for_reconnect=for_reconnect,
+                    )
+                )
 
             # Gemini 3.x wants turn_complete=True, but also won't run inference without a realtime input
             if self._is_gemini_3 and trigger_inference:
@@ -1677,6 +1697,38 @@ class GeminiLiveLLMService(LLMService):
 
     def _post_tool_response_turn_pending(self) -> bool:
         return bool(getattr(self, "_awaiting_post_tool_response_turn", False))
+
+    def _client_content_sent_event(
+        self,
+        *,
+        seed_messages: list[Any],
+        source_messages: list[Any],
+        turn_complete: bool,
+        trigger_inference: bool,
+        initial_seed: bool,
+        for_reconnect: bool,
+    ) -> dict[str, Any]:
+        last_seed = seed_messages[-1] if seed_messages else None
+        return {
+            "type": "client.content.sent",
+            "turn_count": len(seed_messages),
+            "turn_complete": bool(turn_complete),
+            "trigger_inference": bool(trigger_inference),
+            "initial_seed": bool(initial_seed),
+            "for_reconnect": bool(for_reconnect),
+            "source_message_count": len(source_messages),
+            "blank_user_seed": self._is_blank_user_turn(last_seed)
+            and len(seed_messages) > len(source_messages),
+            "last_role": getattr(last_seed, "role", None),
+            "gemini_major": "3" if self._is_gemini_3 else "2",
+        }
+
+    @staticmethod
+    def _is_blank_user_turn(content: Any) -> bool:
+        if getattr(content, "role", None) != "user":
+            return False
+        parts = list(getattr(content, "parts", []) or [])
+        return len(parts) == 1 and getattr(parts[0], "text", None) == " "
 
     @staticmethod
     def _safe_tool_call_event(function_call: Any) -> dict[str, Any]:
