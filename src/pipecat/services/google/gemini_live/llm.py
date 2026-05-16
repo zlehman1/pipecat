@@ -13,6 +13,7 @@ voice transcription, streaming responses, and tool usage.
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import time
@@ -1694,6 +1695,7 @@ class GeminiLiveLLMService(LLMService):
                     "type": "client.function_response.sent",
                     "function_response_count": 1,
                     "tool_call_id_present": bool(tool_call_id),
+                    "tool_call_id_hash": self._safe_tool_call_id_hash(tool_call_id),
                     "tool_name": tool_name,
                 }
             )
@@ -1794,12 +1796,26 @@ class GeminiLiveLLMService(LLMService):
         return len(parts) == 1 and getattr(parts[0], "text", None) == " "
 
     @staticmethod
-    def _safe_tool_call_event(function_call: Any) -> dict[str, Any]:
+    def _safe_tool_call_id_hash(tool_call_id: Any) -> str | None:
+        if not tool_call_id:
+            return None
+        return hashlib.sha256(str(tool_call_id).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _safe_tool_call_event(
+        function_call: Any,
+        *,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        call_id = tool_call_id or getattr(function_call, "id", None)
         args = getattr(function_call, "args", None)
         event: dict[str, Any] = {
             "name": getattr(function_call, "name", None),
-            "id_present": bool(getattr(function_call, "id", None)),
+            "id_present": bool(call_id),
         }
+        tool_call_id_hash = GeminiLiveLLMService._safe_tool_call_id_hash(call_id)
+        if tool_call_id_hash:
+            event["tool_call_id_hash"] = tool_call_id_hash
         if isinstance(args, dict):
             event["arg_keys"] = sorted(str(key) for key in args.keys())
         elif args is not None:
@@ -1903,16 +1919,6 @@ class GeminiLiveLLMService(LLMService):
             return
         if not self._context:
             logger.error("Function calls are not supported without a context object.")
-        await self._emit_provider_event(
-            {
-                "type": "tool_call",
-                "calls": [
-                    self._safe_tool_call_event(function_call)
-                    for function_call in function_calls
-                ],
-            }
-        )
-
         function_calls_llm = [
             FunctionCallFromLLM(
                 context=self._context,
@@ -1926,6 +1932,21 @@ class GeminiLiveLLMService(LLMService):
             )
             for f in function_calls
         ]
+        await self._emit_provider_event(
+            {
+                "type": "tool_call",
+                "calls": [
+                    self._safe_tool_call_event(
+                        source_call,
+                        tool_call_id=function_call.tool_call_id,
+                    )
+                    for source_call, function_call in zip(
+                        function_calls,
+                        function_calls_llm,
+                    )
+                ],
+            }
+        )
         self._pending_tool_response_ids.update(
             f.tool_call_id for f in function_calls_llm if f.tool_call_id
         )
