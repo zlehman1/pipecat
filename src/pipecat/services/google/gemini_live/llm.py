@@ -700,13 +700,22 @@ class GeminiLiveLLMService(LLMService):
     #
 
     async def _handle_interruption(self):
+        await self._discard_deferred_function_calls_for_interruption()
+        if self._awaiting_post_tool_response_turn:
+            self._awaiting_post_tool_response_turn = False
         if self._bot_is_responding:
-            await self._set_bot_is_responding(False)
             if self._settings.modalities == GeminiModalities.AUDIO:
                 await self.push_frame(TTSStoppedFrame())
+            await self._set_bot_is_responding(False, run_pending_function_calls=False)
             # Do not send LLMFullResponseEndFrame here - an interruption
             # already tells the assistant context aggregator that the response
             # is over.
+        else:
+            await self._maybe_reconnect_if_safe()
+
+    async def _handle_msg_interrupted(self):
+        await self._handle_interruption()
+        await self.broadcast_interruption()
 
     async def _handle_user_started_speaking(self, frame):
         self._user_is_speaking = True
@@ -881,25 +890,37 @@ class GeminiLiveLLMService(LLMService):
                         if (
                             tool_call_id
                             and tool_call_id not in self._completed_tool_calls
-                            and response
-                            and response.get("value") != "IN_PROGRESS"
+                            and response is not None
+                            and not (
+                                isinstance(response, dict)
+                                and response.get("value") == "IN_PROGRESS"
+                            )
                         ):
                             # Found a newly-completed function call - send the result to the service
                             sent_to_active_session = True
                             if send_new_results:
                                 sent_to_active_session = await self._tool_result(
-                                    tool_call_id, tool_name, part.function_response.response
+                                    tool_call_id,
+                                    tool_name,
+                                    self._normalize_tool_result_message(response),
                                 )
                             if sent_to_active_session:
                                 self._completed_tool_calls.add(tool_call_id)
 
-    async def _set_bot_is_responding(self, responding: bool):
+    def _normalize_tool_result_message(self, response: Any) -> dict[str, Any]:
+        if isinstance(response, dict):
+            return response
+        return {"value": response}
+
+    async def _set_bot_is_responding(
+        self, responding: bool, *, run_pending_function_calls: bool = True
+    ):
         if self._bot_is_responding == responding:
             return
 
         self._bot_is_responding = responding
 
-        if not self._bot_is_responding:
+        if not self._bot_is_responding and run_pending_function_calls:
             await self._run_pending_function_calls()
 
         if not self._bot_is_responding and self._end_frame_pending_bot_turn_finished:
@@ -966,6 +987,38 @@ class GeminiLiveLLMService(LLMService):
             f"{self}: Executing {len(function_calls)} deferred function calls after bot finished"
         )
         await self.run_function_calls(function_calls)
+
+    async def _discard_deferred_function_calls_for_interruption(self):
+        """Drop deferred tool calls from a turn that Gemini has interrupted.
+
+        Gemini sends tool-call cancellation IDs for interrupted pending calls,
+        but serverContent.interrupted can arrive before that cancellation
+        payload. Clearing only locally deferred calls here prevents a barge-in
+        from causing _set_bot_is_responding(False) to execute a tool that
+        belongs to the canceled assistant turn.
+        """
+        if not self._pending_function_calls:
+            return
+
+        cancelled_ids = {
+            function_call.tool_call_id
+            for function_call in self._pending_function_calls
+            if function_call.tool_call_id
+        }
+        self._pending_function_calls = []
+
+        if cancelled_ids:
+            self._pending_tool_response_ids.difference_update(cancelled_ids)
+            response_sessions = self._tool_response_session_map()
+            for tool_call_id in cancelled_ids:
+                response_sessions.pop(tool_call_id, None)
+                if hasattr(self, "_function_call_tasks"):
+                    await self._cancel_function_calls_by_tool_call_id(tool_call_id)
+
+        logger.debug(
+            f"{self}: discarded {len(cancelled_ids)} deferred Gemini tool call(s) "
+            "after provider interruption"
+        )
 
     async def _release_deferred_end_frame(self):
         """Release a deferred EndFrame and cancel the deferral timeout."""
@@ -1190,7 +1243,7 @@ class GeminiLiveLLMService(LLMService):
                                 # combination with the context aggregator default
                                 # turn strategies.
                                 logger.debug("Gemini VAD: interrupted signal received")
-                                await self.broadcast_interruption()
+                                await self._handle_msg_interrupted()
                             if sc and sc.model_turn:
                                 await self._handle_msg_model_turn(message)
                             if sc and sc.input_transcription:
