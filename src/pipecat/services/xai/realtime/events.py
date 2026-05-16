@@ -105,9 +105,15 @@ class TurnDetection(BaseModel):
 
     Parameters:
         type: Detection type, must be "server_vad" or None for manual.
+        threshold: VAD activation threshold from 0.1 to 0.9.
+        silence_duration_ms: User silence before ending the turn.
+        prefix_padding_ms: Audio included before detected speech start.
     """
 
     type: Literal["server_vad"] | None = "server_vad"
+    threshold: float | None = None
+    silence_duration_ms: int | None = None
+    prefix_padding_ms: int | None = None
 
 
 #

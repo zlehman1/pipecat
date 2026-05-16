@@ -529,7 +529,16 @@ class GrokRealtimeLLMService(LLMService):
         Args:
             event: The client event to send.
         """
-        await self._ws_send(event.model_dump(exclude_none=True))
+        payload = event.model_dump(exclude_none=True)
+        if (
+            isinstance(event, events.SessionUpdateEvent)
+            and event.session.turn_detection
+            and event.session.turn_detection.type is None
+        ):
+            payload.setdefault("session", {}).setdefault("turn_detection", {})[
+                "type"
+            ] = None
+        await self._ws_send(payload)
 
     async def _connect(self):
         """Establish WebSocket connection to Grok."""
