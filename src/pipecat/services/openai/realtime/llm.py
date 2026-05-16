@@ -64,6 +64,17 @@ from pipecat.utils.tracing.service_decorators import traced_openai_realtime, tra
 
 from . import events
 
+
+def _serialize_function_call_output(result: Any) -> str:
+    if isinstance(result, str):
+        try:
+            json.loads(result)
+        except json.JSONDecodeError:
+            return json.dumps(result, ensure_ascii=False)
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
 try:
     from websockets.asyncio.client import connect as websocket_connect
 except ModuleNotFoundError as e:
@@ -1111,6 +1122,6 @@ class OpenAIRealtimeLLMService(LLMService):
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,
-            output=json.dumps(result, ensure_ascii=False),
+            output=_serialize_function_call_output(result),
         )
         await self.send_client_event(events.ConversationItemCreateEvent(item=item))

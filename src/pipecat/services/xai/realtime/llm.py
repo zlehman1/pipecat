@@ -60,6 +60,17 @@ from pipecat.utils.time import time_now_iso8601
 
 from . import events
 
+
+def _serialize_function_call_output(result: Any) -> str:
+    if isinstance(result, str):
+        try:
+            json.loads(result)
+        except json.JSONDecodeError:
+            return json.dumps(result, ensure_ascii=False)
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
 try:
     from websockets.asyncio.client import connect as websocket_connect
 except ModuleNotFoundError as e:
@@ -369,6 +380,7 @@ class GrokRealtimeLLMService(LLMService):
 
     async def _handle_interruption(self):
         """Handle user interruption of assistant speech."""
+        self._discard_pending_function_call_batch()
         self._pending_tool_response_create_until_playback_stop = False
 
         if not self._is_turn_detection_enabled():
@@ -1098,6 +1110,6 @@ class GrokRealtimeLLMService(LLMService):
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,
-            output=json.dumps(result, ensure_ascii=False),
+            output=_serialize_function_call_output(result),
         )
         await self.send_client_event(events.ConversationItemCreateEvent(item=item))
