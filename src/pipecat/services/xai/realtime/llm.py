@@ -289,7 +289,11 @@ class GrokRealtimeLLMService(LLMService):
 
         self._messages_added_manually = {}
         self._pending_function_calls = {}
+        self._pending_function_call_batch = []
+        self._queued_function_call_ids = set()
         self._completed_tool_calls = set()
+        self._unsupported_openai_event_counts = {}
+        self._unhandled_event_counts = {}
 
         self._register_event_handler("on_conversation_item_created")
         self._register_event_handler("on_conversation_item_updated")
@@ -560,6 +564,9 @@ class GrokRealtimeLLMService(LLMService):
                 self._receive_task = None
 
             self._completed_tool_calls = set()
+            self._pending_function_calls = {}
+            self._pending_function_call_batch = []
+            self._queued_function_call_ids = set()
             self._disconnecting = False
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
@@ -667,6 +674,10 @@ class GrokRealtimeLLMService(LLMService):
                 await self._handle_evt_speech_stopped(evt)
             elif evt.type == "response.output_audio_transcript.delta":
                 await self._handle_evt_audio_transcript_delta(evt)
+            elif evt.type == "response.audio_transcript.delta":
+                await self._handle_evt_audio_transcript_delta(evt)
+            elif evt.type in ("response.text.delta", "response.output_text.delta"):
+                await self._handle_evt_text_delta(evt)
             elif evt.type == "response.function_call_arguments.delta":
                 # Function call arguments streaming - we wait for the .done event
                 pass
@@ -681,6 +692,10 @@ class GrokRealtimeLLMService(LLMService):
                 else:
                     await self._handle_evt_error(evt)
                     return
+            elif isinstance(evt, events.UnsupportedOpenAIRealtimeServerEvent):
+                await self._handle_evt_unsupported_openai_realtime_event(evt)
+            else:
+                await self._handle_evt_unhandled(evt)
 
     async def _handle_evt_conversation_created(self, evt):
         """Handle conversation.created event - first event after connecting."""
@@ -784,9 +799,23 @@ class GrokRealtimeLLMService(LLMService):
         # Update conversation items
         for item in evt.response.output:
             await self._call_event_handler("on_conversation_item_updated", item.id, item)
+            if item.type == "function_call" and item.call_id and item.arguments is not None:
+                await self._queue_function_call(
+                    tool_call_id=item.call_id,
+                    function_name=item.name,
+                    arguments=item.arguments,
+                    source="response.done",
+                )
+
+        await self._flush_pending_function_call_batch()
 
     async def _handle_evt_audio_transcript_delta(self, evt):
         """Handle audio transcript delta event."""
+        if evt.delta:
+            await self._push_output_transcript_text_frames(evt.delta)
+
+    async def _handle_evt_text_delta(self, evt):
+        """Handle text delta event."""
         if evt.delta:
             await self._push_output_transcript_text_frames(evt.delta)
 
@@ -812,31 +841,75 @@ class GrokRealtimeLLMService(LLMService):
     async def _handle_evt_function_call_arguments_done(self, evt):
         """Handle function call arguments done event."""
         try:
-            try:
-                args = json.loads(evt.arguments)
-            except (json.JSONDecodeError, TypeError):
-                args = evt.arguments
-
-            function_call_item = self._pending_function_calls.get(evt.call_id)
-            if function_call_item:
-                del self._pending_function_calls[evt.call_id]
-
-                function_calls = [
-                    FunctionCallFromLLM(
-                        context=self._context,
-                        tool_call_id=evt.call_id,
-                        function_name=function_call_item.name,
-                        arguments=args,
-                    )
-                ]
-
-                await self.run_function_calls(function_calls)
-                logger.debug(f"Processed function call: {function_call_item.name}")
-            else:
-                logger.warning(f"No tracked function call found for call_id: {evt.call_id}")
+            function_call_item = self._pending_function_calls.pop(evt.call_id, None)
+            function_name = getattr(function_call_item, "name", None) or getattr(
+                evt, "name", None
+            )
+            await self._queue_function_call(
+                tool_call_id=evt.call_id,
+                function_name=function_name,
+                arguments=evt.arguments,
+                source="response.function_call_arguments.done",
+            )
 
         except Exception as e:
             logger.error(f"Failed to process function call arguments: {e}")
+
+    async def _queue_function_call(
+        self,
+        *,
+        tool_call_id: str,
+        function_name: str | None,
+        arguments: Any,
+        source: str,
+    ):
+        """Queue a function call until the response's tool-call batch is complete."""
+        if not function_name:
+            logger.warning(
+                f"No function name found for Grok tool call {tool_call_id} from {source}"
+            )
+            return
+
+        queued_call_ids = self._queued_function_call_ids_set()
+        if tool_call_id in queued_call_ids:
+            return
+
+        try:
+            args = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            args = arguments
+
+        self._pending_function_call_batch_queue().append(
+            FunctionCallFromLLM(
+                context=self._context,
+                tool_call_id=tool_call_id,
+                function_name=function_name,
+                arguments=args,
+            )
+        )
+        queued_call_ids.add(tool_call_id)
+        logger.debug(f"Queued function call from {source}: {function_name}")
+
+    async def _flush_pending_function_call_batch(self):
+        """Run queued Grok function calls as one Pipecat batch."""
+        function_calls = self._pending_function_call_batch_queue()
+        if not function_calls:
+            return
+
+        self._pending_function_call_batch = []
+        self._queued_function_call_ids = set()
+        await self.run_function_calls(function_calls)
+        logger.debug(f"Processed {len(function_calls)} Grok function call(s)")
+
+    def _pending_function_call_batch_queue(self) -> list[FunctionCallFromLLM]:
+        if not hasattr(self, "_pending_function_call_batch"):
+            self._pending_function_call_batch = []
+        return self._pending_function_call_batch
+
+    def _queued_function_call_ids_set(self) -> set[str]:
+        if not hasattr(self, "_queued_function_call_ids"):
+            self._queued_function_call_ids = set()
+        return self._queued_function_call_ids
 
     async def _handle_evt_speech_started(self, evt):
         """Handle speech started event from VAD."""
@@ -853,6 +926,30 @@ class GrokRealtimeLLMService(LLMService):
     async def _handle_evt_error(self, evt):
         """Handle error event."""
         await self.push_error(error_msg=f"Grok Realtime Error: {evt.error.message}")
+
+    async def _handle_evt_unsupported_openai_realtime_event(self, evt):
+        """Handle xAI-documented unsupported OpenAI Realtime events safely."""
+        counts = self._unsupported_openai_event_counts_dict()
+        counts[evt.type] = counts.get(evt.type, 0) + 1
+        logger.debug(
+            f"Ignoring xAI-documented unsupported OpenAI Realtime server event: {evt.type}"
+        )
+
+    async def _handle_evt_unhandled(self, evt):
+        """Handle parsed events that do not affect the Pipecat pipeline."""
+        counts = self._unhandled_event_counts_dict()
+        counts[evt.type] = counts.get(evt.type, 0) + 1
+        logger.debug(f"Ignoring unhandled Grok Realtime server event: {evt.type}")
+
+    def _unsupported_openai_event_counts_dict(self) -> dict[str, int]:
+        if not hasattr(self, "_unsupported_openai_event_counts"):
+            self._unsupported_openai_event_counts = {}
+        return self._unsupported_openai_event_counts
+
+    def _unhandled_event_counts_dict(self) -> dict[str, int]:
+        if not hasattr(self, "_unhandled_event_counts"):
+            self._unhandled_event_counts = {}
+        return self._unhandled_event_counts
 
     #
     # Response creation

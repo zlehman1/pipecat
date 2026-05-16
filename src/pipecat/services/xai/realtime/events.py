@@ -14,7 +14,7 @@ import json
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
@@ -22,8 +22,33 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 # Audio format configuration
 #
 
-# Grok supports configurable sample rates for PCM audio
-SUPPORTED_SAMPLE_RATES = Literal[8000, 16000, 21050, 24000, 32000, 44100, 48000]
+# Grok supports configurable sample rates for PCM audio.
+SUPPORTED_SAMPLE_RATES = Literal[8000, 16000, 22050, 24000, 32000, 44100, 48000]
+
+XAI_UNSUPPORTED_OPENAI_CLIENT_EVENTS = frozenset(
+    {
+        "conversation.item.retrieve",
+        "conversation.item.truncate",
+        "output_audio_buffer.clear",
+    }
+)
+
+XAI_UNSUPPORTED_OPENAI_SERVER_EVENTS = frozenset(
+    {
+        "conversation.item.done",
+        "conversation.item.input_audio_transcription.delta",
+        "conversation.item.input_audio_transcription.failed",
+        "conversation.item.input_audio_transcription.segment",
+        "conversation.item.retrieved",
+        "conversation.item.truncated",
+        "input_audio_buffer.dtmf_event_received",
+        "input_audio_buffer.timeout_triggered",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
+        "rate_limits.updated",
+    }
+)
 
 
 class AudioFormat(BaseModel):
@@ -35,7 +60,7 @@ class AudioFormat(BaseModel):
 class PCMAudioFormat(AudioFormat):
     """PCM audio format configuration with configurable sample rate.
 
-    Grok supports: 8000, 16000, 21050, 24000, 32000, 44100, 48000 Hz
+    Grok supports: 8000, 16000, 22050, 24000, 32000, 44100, 48000 Hz
 
     Parameters:
         type: Audio format type, always "audio/pcm".
@@ -567,9 +592,9 @@ class ResponseAudioTranscriptDelta(ServerEvent):
         delta: Incremental transcript text.
     """
 
-    type: Literal["response.output_audio_transcript.delta"]
-    response_id: str
-    item_id: str
+    type: Literal["response.output_audio_transcript.delta", "response.audio_transcript.delta"]
+    response_id: str | None = None
+    item_id: str | None = None
     delta: str
 
 
@@ -585,6 +610,22 @@ class ResponseAudioTranscriptDone(ServerEvent):
     type: Literal["response.output_audio_transcript.done"]
     response_id: str
     item_id: str
+
+
+class ResponseTextDelta(ServerEvent):
+    """Event containing incremental text output from a response.
+
+    xAI emits the OpenAI beta ``response.text.delta`` event name for text output.
+    ``response.output_text.delta`` is accepted as an alias so OpenAI-compatible
+    replay/SDK layers do not drop assistant text.
+    """
+
+    type: Literal["response.text.delta", "response.output_text.delta"]
+    response_id: str | None = None
+    item_id: str | None = None
+    output_index: int | None = None
+    content_index: int | None = None
+    delta: str
 
 
 class ResponseAudioDelta(ServerEvent):
@@ -647,13 +688,13 @@ class ResponseFunctionCallArgumentsDone(ServerEvent):
     Parameters:
         type: Event type, always "response.function_call_arguments.done".
         call_id: ID of the function call.
-        name: Name of the function being called.
+        name: Name of the function being called, when present.
         arguments: Complete function arguments as JSON string.
     """
 
     type: Literal["response.function_call_arguments.done"]
     call_id: str
-    name: str
+    name: str | None = None
     arguments: str
 
 
@@ -808,6 +849,17 @@ class ErrorEvent(ServerEvent):
     error: RealtimeError
 
 
+class UnsupportedOpenAIRealtimeServerEvent(ServerEvent):
+    """An OpenAI Realtime event that xAI documents as unsupported.
+
+    These events are expected provider differences, not parser failures.
+    """
+
+    event_id: str | None = None
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 #
 # Event parsing
 #
@@ -829,13 +881,20 @@ _server_event_types = {
     "response.content_part.added": ResponseContentPartAdded,
     "response.content_part.done": ResponseContentPartDone,
     "response.output_audio_transcript.delta": ResponseAudioTranscriptDelta,
+    "response.audio_transcript.delta": ResponseAudioTranscriptDelta,
     "response.output_audio_transcript.done": ResponseAudioTranscriptDone,
+    "response.text.delta": ResponseTextDelta,
+    "response.output_text.delta": ResponseTextDelta,
     "response.output_audio.delta": ResponseAudioDelta,
     "response.output_audio.done": ResponseAudioDone,
     "response.function_call_arguments.delta": ResponseFunctionCallArgumentsDelta,
     "response.function_call_arguments.done": ResponseFunctionCallArgumentsDone,
     "response.done": ResponseDone,
 }
+
+
+class ServerEventParseError(Exception):
+    """Safe parse error that does not include provider payload content."""
 
 
 def parse_server_event(data: str):
@@ -852,9 +911,30 @@ def parse_server_event(data: str):
     """
     try:
         event = json.loads(data)
-        event_type = event["type"]
-        if event_type not in _server_event_types:
-            raise Exception(f"Unimplemented server event type: {event_type}")
-        return _server_event_types[event_type].model_validate(event)
     except Exception as e:
-        raise Exception(f"{e} \n\n{data}")
+        raise ServerEventParseError(f"Invalid server event JSON: {type(e).__name__}") from e
+
+    if not isinstance(event, dict):
+        raise ServerEventParseError("Invalid server event payload: expected object")
+
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or not event_type:
+        raise ServerEventParseError("Invalid server event payload: missing type")
+
+    if event_type in XAI_UNSUPPORTED_OPENAI_SERVER_EVENTS:
+        return UnsupportedOpenAIRealtimeServerEvent(
+            event_id=event.get("event_id"),
+            type=event_type,
+            payload=event,
+        )
+
+    event_model = _server_event_types.get(event_type)
+    if event_model is None:
+        raise ServerEventParseError(f"Unimplemented server event type: {event_type}")
+
+    try:
+        return event_model.model_validate(event)
+    except ValidationError as e:
+        raise ServerEventParseError(
+            f"Invalid server event payload for type={event_type}: {type(e).__name__}"
+        ) from e
