@@ -892,6 +892,7 @@ class ResponseFunctionCallArgumentsDone(ServerEvent):
         item_id: ID of the conversation item.
         output_index: Index of the output item.
         call_id: ID of the function call.
+        name: Name of the function call.
         arguments: Complete function arguments as JSON string.
     """
 
@@ -900,6 +901,7 @@ class ResponseFunctionCallArgumentsDone(ServerEvent):
     item_id: str
     output_index: int
     call_id: str
+    name: str | None = None
     arguments: str
 
 
