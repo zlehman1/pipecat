@@ -42,6 +42,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    LLMProviderEventFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
     LLMThoughtEndFrame,
@@ -572,6 +573,7 @@ class GeminiLiveLLMService(LLMService):
 
         # Bookkeeping for tool calls
         self._completed_tool_calls = set()
+        self._provider_event_session_sequence_id: str | None = None
 
     def create_client(self):
         """Create the Gemini API client instance. Subclasses can override this."""
@@ -1365,6 +1367,7 @@ class GeminiLiveLLMService(LLMService):
             if self._session:
                 await self._session.close()
                 self._session = None
+            self._provider_event_session_sequence_id = None
             self._session_ready_event.clear()
             self._ready_for_realtime_input = False
             self._pending_tool_response_ids.clear()
@@ -1623,6 +1626,14 @@ class GeminiLiveLLMService(LLMService):
 
         try:
             await self._session.send_tool_response(function_responses=response)
+            await self._emit_provider_event(
+                {
+                    "type": "client.function_response.sent",
+                    "function_response_count": 1,
+                    "tool_call_id_present": bool(tool_call_id),
+                    "tool_name": tool_name,
+                }
+            )
             if self._is_gemini_3:
                 await self._session.send_realtime_input(text=" ")
             self._awaiting_post_tool_response_turn = True
@@ -1638,14 +1649,58 @@ class GeminiLiveLLMService(LLMService):
     async def _handle_session_ready(self, session: AsyncSession):
         """Handle the session being ready."""
         self._session = session
+        self._provider_event_session_sequence_id = f"gemini_live_session_{uuid.uuid4().hex}"
         self._ready_for_realtime_input = True
         self._session_ready_event.set()
+
+    async def _emit_provider_event(self, event: dict[str, Any]) -> None:
+        session_sequence_id = getattr(self, "_provider_event_session_sequence_id", None)
+        if not session_sequence_id:
+            return
+        provider_event = {
+            **event,
+            "session_sequence_id": session_sequence_id,
+        }
+        try:
+            await self.push_frame(
+                LLMProviderEventFrame(
+                    provider="google_realtime",
+                    event=provider_event,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"{self}: failed to emit Gemini provider event: {exc}")
+
+    def _post_tool_response_turn_pending(self) -> bool:
+        return bool(getattr(self, "_awaiting_post_tool_response_turn", False))
+
+    @staticmethod
+    def _safe_tool_call_event(function_call: Any) -> dict[str, Any]:
+        args = getattr(function_call, "args", None)
+        event: dict[str, Any] = {
+            "name": getattr(function_call, "name", None),
+            "id_present": bool(getattr(function_call, "id", None)),
+        }
+        if isinstance(args, dict):
+            event["arg_keys"] = sorted(str(key) for key in args.keys())
+        elif args is not None:
+            event["arg_type"] = type(args).__name__
+        return event
 
     async def _handle_msg_model_turn(self, msg: LiveServerMessage):
         """Handle the model turn message."""
         parts = msg.server_content.model_turn.parts
         if not parts:
             return
+
+        await self._emit_provider_event(
+            {
+                "type": "server_content",
+                "model_turn_output": True,
+                "post_tool": self._post_tool_response_turn_pending(),
+                "turn_complete": False,
+            }
+        )
 
         await self.stop_ttfb_metrics()
 
@@ -1729,6 +1784,15 @@ class GeminiLiveLLMService(LLMService):
             return
         if not self._context:
             logger.error("Function calls are not supported without a context object.")
+        await self._emit_provider_event(
+            {
+                "type": "tool_call",
+                "calls": [
+                    self._safe_tool_call_event(function_call)
+                    for function_call in function_calls
+                ],
+            }
+        )
 
         function_calls_llm = [
             FunctionCallFromLLM(
@@ -1782,6 +1846,12 @@ class GeminiLiveLLMService(LLMService):
             return
 
         cancelled_ids = set(ids)
+        await self._emit_provider_event(
+            {
+                "type": "tool_call_cancellation",
+                "ids_present": len(cancelled_ids),
+            }
+        )
         self._pending_tool_response_ids.difference_update(cancelled_ids)
         response_sessions = self._tool_response_session_map()
         for tool_call_id in cancelled_ids:
@@ -1805,6 +1875,14 @@ class GeminiLiveLLMService(LLMService):
     async def _handle_msg_turn_complete(self, message: LiveServerMessage):
         """Handle the turn complete message."""
         text = self._bot_text_buffer
+        await self._emit_provider_event(
+            {
+                "type": "server_content",
+                "model_turn_output": False,
+                "post_tool": self._post_tool_response_turn_pending(),
+                "turn_complete": True,
+            }
+        )
 
         # Trace the complete LLM response (this will be handled by the decorator)
         # The decorator will extract the output text and usage metadata from the message
@@ -1955,6 +2033,16 @@ class GeminiLiveLLMService(LLMService):
 
         if not text:
             return
+
+        await self._emit_provider_event(
+            {
+                "type": "server_content",
+                "model_turn_output": True,
+                "output_transcription": True,
+                "post_tool": self._post_tool_response_turn_pending(),
+                "turn_complete": False,
+            }
+        )
 
         # Accumulate text for grounding as well
         self._search_result_buffer += text

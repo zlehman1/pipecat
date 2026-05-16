@@ -559,6 +559,19 @@ class LLMRunFrame(DataFrame):
 
 
 @dataclass
+class LLMProviderEventFrame(DataFrame):
+    """PHI-safe provider event for runtime QA and benchmark proof.
+
+    These events are emitted by provider-native realtime services when a raw
+    provider lifecycle event is needed for debugging or proof collection.
+    Payloads must be sanitized before this frame is pushed.
+    """
+
+    provider: str
+    event: Mapping[str, Any]
+
+
+@dataclass
 class LLMMessagesAppendFrame(DataFrame):
     """Frame containing LLM messages to append to current context.
 
