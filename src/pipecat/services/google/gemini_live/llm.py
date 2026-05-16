@@ -525,6 +525,7 @@ class GeminiLiveLLMService(LLMService):
         self._reconnect_pending = False
         self._pending_function_calls = []
         self._pending_tool_response_ids: set[str] = set()
+        self._tool_response_session_by_id: dict[str, Any] = {}
         self._awaiting_post_tool_response_turn = False
         self._user_audio_buffer = bytearray()
         self._user_transcription_buffer = ""
@@ -882,6 +883,11 @@ class GeminiLiveLLMService(LLMService):
         """Return true while Gemini is waiting for tool results on the active session."""
         return bool(self._pending_tool_response_ids)
 
+    def _tool_response_session_map(self) -> dict[str, Any]:
+        if not hasattr(self, "_tool_response_session_by_id"):
+            self._tool_response_session_by_id = {}
+        return self._tool_response_session_by_id
+
     def _should_defer_reconnect_for_tool_call(self) -> bool:
         return (
             self._bot_is_responding
@@ -1220,10 +1226,10 @@ class GeminiLiveLLMService(LLMService):
 
     async def _reconnect(self):
         """Reconnect to Gemini Live API."""
-        await self._disconnect()
+        await self._disconnect(preserve_tool_response_origins=True)
         await self._connect(session_resumption_handle=self._session_resumption_handle)
 
-    async def _disconnect(self):
+    async def _disconnect(self, *, preserve_tool_response_origins: bool = False):
         """Disconnect from Gemini Live API and clean up resources."""
         logger.info("Disconnecting from Gemini service")
         try:
@@ -1243,6 +1249,8 @@ class GeminiLiveLLMService(LLMService):
             self._session_ready_event.clear()
             self._ready_for_realtime_input = False
             self._pending_tool_response_ids.clear()
+            if not preserve_tool_response_origins:
+                self._tool_response_session_map().clear()
             self._awaiting_post_tool_response_turn = False
             self._disconnecting = False
         except Exception as e:
@@ -1464,9 +1472,29 @@ class GeminiLiveLLMService(LLMService):
         """Send tool result back to the API."""
         if self._disconnecting:
             self._pending_tool_response_ids.discard(tool_call_id)
+            self._tool_response_session_map().pop(tool_call_id, None)
+            return False
+
+        expected_session = self._tool_response_session_map().get(tool_call_id)
+        if expected_session is None and tool_call_id not in self._pending_tool_response_ids:
+            logger.warning(
+                f"{self}: ignoring untracked Gemini Live tool response for "
+                f"tool_call_id={tool_call_id}"
+            )
             return False
 
         await self._session_ready_event.wait()
+
+        if expected_session is not None and self._session is not expected_session:
+            logger.error(
+                f"{self}: refusing to send Gemini Live tool response "
+                f"tool_call_id={tool_call_id} on a different websocket session"
+            )
+            self._pending_tool_response_ids.discard(tool_call_id)
+            self._tool_response_session_map().pop(tool_call_id, None)
+            self._completed_tool_calls.add(tool_call_id)
+            await self._maybe_reconnect_if_safe()
+            return False
 
         logger.debug(f"In _tool_result. Sending FunctionResponse for tool: {tool_name}")
 
@@ -1485,6 +1513,7 @@ class GeminiLiveLLMService(LLMService):
             return False
         finally:
             self._pending_tool_response_ids.discard(tool_call_id)
+            self._tool_response_session_map().pop(tool_call_id, None)
 
     @traced_gemini_live(operation="llm_setup")
     async def _handle_session_ready(self, session: AsyncSession):
@@ -1598,6 +1627,11 @@ class GeminiLiveLLMService(LLMService):
         self._pending_tool_response_ids.update(
             f.tool_call_id for f in function_calls_llm if f.tool_call_id
         )
+        origin_session = getattr(self, "_session", None)
+        response_sessions = self._tool_response_session_map()
+        for function_call in function_calls_llm:
+            if function_call.tool_call_id:
+                response_sessions[function_call.tool_call_id] = origin_session
 
         if self._bot_is_responding:
             pending_ids = {
@@ -1630,6 +1664,9 @@ class GeminiLiveLLMService(LLMService):
 
         cancelled_ids = set(ids)
         self._pending_tool_response_ids.difference_update(cancelled_ids)
+        response_sessions = self._tool_response_session_map()
+        for tool_call_id in cancelled_ids:
+            response_sessions.pop(tool_call_id, None)
         self._pending_function_calls = [
             function_call
             for function_call in self._pending_function_calls
