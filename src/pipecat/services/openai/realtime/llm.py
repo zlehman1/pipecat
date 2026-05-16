@@ -913,8 +913,13 @@ class OpenAIRealtimeLLMService(LLMService):
         # Process the function call immediately when arguments are complete
         # This is needed because function calls might not trigger response.done
         try:
-            # Parse the arguments
-            args = json.loads(evt.arguments)
+            # Parse the arguments. If the provider emits malformed JSON, keep
+            # the raw payload and let the registered tool handler fail closed
+            # with a structured tool result.
+            try:
+                args = json.loads(evt.arguments)
+            except (json.JSONDecodeError, TypeError):
+                args = evt.arguments
 
             # Get the function call item we tracked earlier
             function_call_item = self._pending_function_calls.get(evt.call_id)

@@ -524,6 +524,8 @@ class GeminiLiveLLMService(LLMService):
         self._user_is_muted = False
         self._reconnect_pending = False
         self._pending_function_calls = []
+        self._pending_tool_response_ids: set[str] = set()
+        self._awaiting_post_tool_response_turn = False
         self._user_audio_buffer = bytearray()
         self._user_transcription_buffer = ""
         self._last_transcription_sent = ""
@@ -603,7 +605,7 @@ class GeminiLiveLLMService(LLMService):
             # First time setting system_instruction
             if not self._session:
                 await self._connect()
-            elif self._bot_is_responding:
+            elif self._should_defer_reconnect_for_tool_call():
                 self._reconnect_pending = True
             else:
                 await self._reconnect()
@@ -854,11 +856,13 @@ class GeminiLiveLLMService(LLMService):
                             and response.get("value") != "IN_PROGRESS"
                         ):
                             # Found a newly-completed function call - send the result to the service
+                            sent_to_active_session = True
                             if send_new_results:
-                                await self._tool_result(
+                                sent_to_active_session = await self._tool_result(
                                     tool_call_id, tool_name, part.function_response.response
                                 )
-                            self._completed_tool_calls.add(tool_call_id)
+                            if sent_to_active_session:
+                                self._completed_tool_calls.add(tool_call_id)
 
     async def _set_bot_is_responding(self, responding: bool):
         if self._bot_is_responding == responding:
@@ -872,9 +876,24 @@ class GeminiLiveLLMService(LLMService):
         if not self._bot_is_responding and self._end_frame_pending_bot_turn_finished:
             await self._release_deferred_end_frame()
 
-        if not self._bot_is_responding and self._reconnect_pending:
-            self._reconnect_pending = False
-            await self._reconnect()
+        await self._maybe_reconnect_if_safe()
+
+    def _has_pending_tool_responses(self) -> bool:
+        """Return true while Gemini is waiting for tool results on the active session."""
+        return bool(self._pending_tool_response_ids)
+
+    def _should_defer_reconnect_for_tool_call(self) -> bool:
+        return (
+            self._bot_is_responding
+            or self._has_pending_tool_responses()
+            or self._awaiting_post_tool_response_turn
+        )
+
+    async def _maybe_reconnect_if_safe(self):
+        if not self._reconnect_pending or self._should_defer_reconnect_for_tool_call():
+            return
+        self._reconnect_pending = False
+        await self._reconnect()
 
     async def _run_pending_function_calls(self):
         """Run any function calls that were deferred while the bot was responding."""
@@ -1129,6 +1148,8 @@ class GeminiLiveLLMService(LLMService):
                                     await self._handle_msg_usage_metadata(message)
                             if message.tool_call:
                                 await self._handle_msg_tool_call(message)
+                            if message.tool_call_cancellation:
+                                await self._handle_msg_tool_call_cancellation(message)
                             if message.session_resumption_update:
                                 self._handle_msg_resumption_update(message)
                     except Exception as e:
@@ -1221,6 +1242,8 @@ class GeminiLiveLLMService(LLMService):
                 self._session = None
             self._session_ready_event.clear()
             self._ready_for_realtime_input = False
+            self._pending_tool_response_ids.clear()
+            self._awaiting_post_tool_response_turn = False
             self._disconnecting = False
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
@@ -1376,7 +1399,7 @@ class GeminiLiveLLMService(LLMService):
 
         # Enforce Gemini 2.5's "seed must end with user turn" requirement.
         seed_messages = messages
-        if not self._is_gemini_3:
+        if messages and not self._is_gemini_3:
             last_role = getattr(messages[-1], "role", None)
             if last_role != "user":
                 seed_messages = messages + [Content(role="user", parts=[Part(text=" ")])]
@@ -1386,7 +1409,7 @@ class GeminiLiveLLMService(LLMService):
         try:
             if messages:
                 await self._session.send_client_content(
-                    turns=messages, turn_complete=self._inference_on_context_initialization
+                    turns=seed_messages, turn_complete=trigger_inference
                 )
 
             # Gemini 3.x wants turn_complete=True, but also won't run inference without a realtime input
@@ -1437,10 +1460,11 @@ class GeminiLiveLLMService(LLMService):
     @traced_gemini_live(operation="llm_tool_result")
     async def _tool_result(
         self, tool_call_id: str, tool_name: str, tool_result_message: dict[str, Any]
-    ):
+    ) -> bool:
         """Send tool result back to the API."""
         if self._disconnecting:
-            return
+            self._pending_tool_response_ids.discard(tool_call_id)
+            return False
 
         await self._session_ready_event.wait()
 
@@ -1454,8 +1478,13 @@ class GeminiLiveLLMService(LLMService):
             await self._session.send_tool_response(function_responses=response)
             if self._is_gemini_3:
                 await self._session.send_realtime_input(text=" ")
+            self._awaiting_post_tool_response_turn = True
+            return True
         except Exception as e:
             await self._handle_send_error(e)
+            return False
+        finally:
+            self._pending_tool_response_ids.discard(tool_call_id)
 
     @traced_gemini_live(operation="llm_setup")
     async def _handle_session_ready(self, session: AsyncSession):
@@ -1566,14 +1595,55 @@ class GeminiLiveLLMService(LLMService):
             )
             for f in function_calls
         ]
+        self._pending_tool_response_ids.update(
+            f.tool_call_id for f in function_calls_llm if f.tool_call_id
+        )
 
         if self._bot_is_responding:
-            self._pending_function_calls = function_calls_llm
+            pending_ids = {
+                function_call.tool_call_id
+                for function_call in self._pending_function_calls
+                if function_call.tool_call_id
+            }
+            for function_call in function_calls_llm:
+                if function_call.tool_call_id in pending_ids:
+                    continue
+                self._pending_function_calls.append(function_call)
+                if function_call.tool_call_id:
+                    pending_ids.add(function_call.tool_call_id)
             logger.debug(
                 f"{self}: Deferring {len(function_calls_llm)} function calls until after bot finishes"
             )
         else:
             await self.run_function_calls(function_calls_llm)
+
+    async def _handle_msg_tool_call_cancellation(self, message: LiveServerMessage):
+        """Handle Gemini Live tool-call cancellation messages.
+
+        Gemini emits this on interruption for tool calls that should not be
+        executed. Keep local deferred/pending state in sync so interrupted
+        calls cannot run later and pending reconnects are not held forever.
+        """
+        ids = getattr(message.tool_call_cancellation, "ids", None) or []
+        if not ids:
+            return
+
+        cancelled_ids = set(ids)
+        self._pending_tool_response_ids.difference_update(cancelled_ids)
+        self._pending_function_calls = [
+            function_call
+            for function_call in self._pending_function_calls
+            if function_call.tool_call_id not in cancelled_ids
+        ]
+
+        if hasattr(self, "_function_call_tasks"):
+            for tool_call_id in cancelled_ids:
+                await self._cancel_function_calls_by_tool_call_id(tool_call_id)
+
+        logger.debug(
+            f"{self}: Gemini cancelled tool calls: {sorted(cancelled_ids)}"
+        )
+        await self._maybe_reconnect_if_safe()
 
     @traced_gemini_live(operation="llm_response")
     async def _handle_msg_turn_complete(self, message: LiveServerMessage):
@@ -1605,6 +1675,10 @@ class GeminiLiveLLMService(LLMService):
             else:
                 # TEXT modality case
                 await self.push_frame(LLMFullResponseEndFrame())
+
+        if self._awaiting_post_tool_response_turn:
+            self._awaiting_post_tool_response_turn = False
+            await self._maybe_reconnect_if_safe()
 
     @traced_stt
     async def _handle_user_transcription(

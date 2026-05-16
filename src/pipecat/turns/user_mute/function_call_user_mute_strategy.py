@@ -48,7 +48,7 @@ class FunctionCallUserMuteStrategy(BaseUserMuteStrategy):
         if isinstance(frame, FunctionCallsStartedFrame):
             await self._handle_function_calls_started(frame)
         elif isinstance(frame, (FunctionCallCancelFrame, FunctionCallResultFrame)):
-            self._function_call_in_progress.remove(frame.tool_call_id)
+            self._function_call_in_progress.discard(frame.tool_call_id)
 
         return bool(self._function_call_in_progress)
 

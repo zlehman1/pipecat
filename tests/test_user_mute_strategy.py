@@ -138,6 +138,55 @@ class TestFunctionCallUserMuteStrategy(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(await strategy.process_frame(InterruptionFrame()))
 
+    async def test_unmatched_function_result_and_cancel_do_not_raise(self):
+        strategy = FunctionCallUserMuteStrategy()
+
+        self.assertFalse(
+            await strategy.process_frame(
+                FunctionCallResultFrame(
+                    function_name="fn_missing",
+                    tool_call_id="missing",
+                    arguments={},
+                    result={},
+                )
+            )
+        )
+        self.assertFalse(
+            await strategy.process_frame(
+                FunctionCallCancelFrame(
+                    function_name="fn_missing",
+                    tool_call_id="missing",
+                )
+            )
+        )
+
+        self.assertTrue(
+            await strategy.process_frame(
+                FunctionCallsStartedFrame(
+                    function_calls=[
+                        FunctionCallFromLLM(
+                            function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                        )
+                    ]
+                )
+            )
+        )
+        self.assertTrue(
+            await strategy.process_frame(
+                FunctionCallResultFrame(
+                    function_name="fn_missing",
+                    tool_call_id="missing",
+                    arguments={},
+                    result={},
+                )
+            )
+        )
+        self.assertFalse(
+            await strategy.process_frame(
+                FunctionCallCancelFrame(function_name="fn_1", tool_call_id="1")
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

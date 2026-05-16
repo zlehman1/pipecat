@@ -812,7 +812,10 @@ class GrokRealtimeLLMService(LLMService):
     async def _handle_evt_function_call_arguments_done(self, evt):
         """Handle function call arguments done event."""
         try:
-            args = json.loads(evt.arguments)
+            try:
+                args = json.loads(evt.arguments)
+            except (json.JSONDecodeError, TypeError):
+                args = evt.arguments
 
             function_call_item = self._pending_function_calls.get(evt.call_id)
             if function_call_item:
@@ -822,13 +825,13 @@ class GrokRealtimeLLMService(LLMService):
                     FunctionCallFromLLM(
                         context=self._context,
                         tool_call_id=evt.call_id,
-                        function_name=evt.name,
+                        function_name=function_call_item.name,
                         arguments=args,
                     )
                 ]
 
                 await self.run_function_calls(function_calls)
-                logger.debug(f"Processed function call: {evt.name}")
+                logger.debug(f"Processed function call: {function_call_item.name}")
             else:
                 logger.warning(f"No tracked function call found for call_id: {evt.call_id}")
 
