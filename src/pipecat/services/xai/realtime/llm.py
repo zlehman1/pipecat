@@ -292,6 +292,7 @@ class GrokRealtimeLLMService(LLMService):
         self._pending_function_call_batch = []
         self._queued_function_call_ids = set()
         self._completed_tool_calls = set()
+        self._pending_tool_response_create_until_playback_stop = False
         self._unsupported_openai_event_counts = {}
         self._unhandled_event_counts = {}
 
@@ -368,6 +369,8 @@ class GrokRealtimeLLMService(LLMService):
 
     async def _handle_interruption(self):
         """Handle user interruption of assistant speech."""
+        self._pending_tool_response_create_until_playback_stop = False
+
         if not self._is_turn_detection_enabled():
             await self.send_client_event(events.InputAudioBufferClearEvent())
             await self.send_client_event(events.ResponseCancelEvent())
@@ -392,6 +395,9 @@ class GrokRealtimeLLMService(LLMService):
     async def _handle_bot_stopped_speaking(self):
         """Handle bot stopped speaking event."""
         self._current_audio_response = None
+        if self._pending_tool_response_create_until_playback_stop:
+            self._pending_tool_response_create_until_playback_stop = False
+            await self._create_response()
 
     def _calculate_audio_duration_ms(
         self, total_bytes: int, sample_rate: int = None, bytes_per_sample: int = 2
@@ -576,6 +582,7 @@ class GrokRealtimeLLMService(LLMService):
             self._pending_function_calls = {}
             self._pending_function_call_batch = []
             self._queued_function_call_ids = set()
+            self._pending_tool_response_create_until_playback_stop = False
             self._disconnecting = False
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
@@ -1048,7 +1055,7 @@ class GrokRealtimeLLMService(LLMService):
             )
         )
 
-    async def _process_completed_function_calls(self, send_new_results: bool):
+    async def _process_completed_function_calls(self, send_new_results: bool) -> bool:
         """Process completed function calls and send results to the service."""
         sent_new_result = False
 
@@ -1062,7 +1069,16 @@ class GrokRealtimeLLMService(LLMService):
                     self._completed_tool_calls.add(tool_call_id)
 
         if sent_new_result:
-            await self._create_response()
+            if self._current_audio_response:
+                logger.debug(
+                    "Deferring Grok response.create for tool results until current "
+                    "assistant audio playback stops"
+                )
+                self._pending_tool_response_create_until_playback_stop = True
+            else:
+                await self._create_response()
+
+        return sent_new_result
 
     async def _send_user_audio(self, frame):
         """Send user audio to Grok."""
