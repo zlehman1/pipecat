@@ -1502,8 +1502,9 @@ class GeminiLiveLLMService(LLMService):
             Gemini 2.5's ``send_client_content`` requires the seed's final
             turn to be a user turn. When it isn't (e.g. on reconnect where
             the bot had finished speaking before the disconnect), we append
-            a blank user turn to satisfy the server. Gemini 3.x has no such
-            requirement.
+            a blank user turn to satisfy the server. When there is no history,
+            we send a blank user turn so the session still has a valid seed to
+            commit. Gemini 3.x has no such requirement.
 
         Args:
             for_reconnect: When True, we're re-seeding after a reconnect.
@@ -1525,19 +1526,22 @@ class GeminiLiveLLMService(LLMService):
         else:
             trigger_inference = self._inference_on_context_initialization
 
-        logger.debug(f"Creating initial response: {messages}")
+        logger.debug(f"Creating initial response: {messages} trigger_inference:{trigger_inference}")
 
         # Enforce Gemini 2.5's "seed must end with user turn" requirement.
         seed_messages = messages
-        if messages and not self._is_gemini_3:
-            last_role = getattr(messages[-1], "role", None)
-            if last_role != "user":
-                seed_messages = messages + [Content(role="user", parts=[Part(text=" ")])]
+        if not self._is_gemini_3:
+            if messages:
+                last_role = getattr(messages[-1], "role", None)
+                if last_role != "user":
+                    seed_messages = messages + [Content(role="user", parts=[Part(text=" ")])]
+            else:
+                seed_messages = [Content(role="user", parts=[Part(text=" ")])]
 
         await self.start_ttfb_metrics()
 
         try:
-            if messages:
+            if seed_messages:
                 await self._session.send_client_content(
                     turns=seed_messages, turn_complete=trigger_inference
                 )
@@ -1551,7 +1555,7 @@ class GeminiLiveLLMService(LLMService):
         # Gemini 2.5-only workaround: when we've seeded without triggering
         # inference, flag that the next user_stopped_speaking should send
         # turn_complete=True so 2.5 picks up the seeded history.
-        if not trigger_inference and not self._is_gemini_3:
+        if not trigger_inference and not self._is_gemini_3 and seed_messages:
             self._needs_initial_turn_complete_message = True
 
         self._ready_for_realtime_input = True
