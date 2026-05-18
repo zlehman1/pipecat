@@ -564,6 +564,7 @@ class GeminiLiveLLMService(LLMService):
 
         # Session resumption
         self._session_resumption_handle: str | None = None
+        self._has_connected_once = False
 
         # Bookkeeping for ending gracefully (i.e. after the bot is finished)
         self._end_frame_pending_bot_turn_finished: EndFrame | None = None
@@ -614,8 +615,10 @@ class GeminiLiveLLMService(LLMService):
             if not self._session:
                 await self._connect()
             elif self._should_defer_reconnect_for_tool_call():
+                self._discard_session_resumption_handle_for_fresh_reconnect()
                 self._reconnect_pending = True
             else:
+                self._discard_session_resumption_handle_for_fresh_reconnect()
                 await self._reconnect()
 
         remaining = {k: v for k, v in changed.items() if k != "system_instruction"}
@@ -870,11 +873,19 @@ class GeminiLiveLLMService(LLMService):
         if not self._session:
             return
 
+        self._discard_session_resumption_handle_for_fresh_reconnect()
         if self._should_defer_reconnect_for_tool_call():
             logger.debug(f"{self}: deferring Gemini Live tool-surface reconnect")
             self._reconnect_pending = True
         else:
             await self._reconnect()
+
+    def _discard_session_resumption_handle_for_fresh_reconnect(self) -> None:
+        # A node-transition reconnect changes the prompt/tool surface. Reusing
+        # Gemini's last resumption handle can restore server-side history from
+        # before the caller's latest turn, so force a fresh session and seed it
+        # from the client-side context when it becomes ready.
+        self._session_resumption_handle = None
 
     async def _handle_context(self, context: LLMContext):
         if not self._handled_initial_context:
@@ -1719,10 +1730,18 @@ class GeminiLiveLLMService(LLMService):
     @traced_gemini_live(operation="llm_setup")
     async def _handle_session_ready(self, session: AsyncSession):
         """Handle the session being ready."""
+        was_reconnect = getattr(self, "_has_connected_once", False)
+        self._has_connected_once = True
         self._session = session
         self._provider_event_session_sequence_id = f"gemini_live_session_{uuid.uuid4().hex}"
         self._ready_for_realtime_input = True
         self._session_ready_event.set()
+        if (
+            was_reconnect
+            and self._handled_initial_context
+            and not self._session_resumption_handle
+        ):
+            await self._create_initial_response(for_reconnect=True)
 
     async def _emit_provider_event(self, event: dict[str, Any]) -> None:
         session_sequence_id = getattr(self, "_provider_event_session_sequence_id", None)
